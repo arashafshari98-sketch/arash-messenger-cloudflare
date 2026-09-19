@@ -1,0 +1,21 @@
+{
+  "name": "arash-messenger",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-19",
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAT",
+        "class_name": "ChatRoom"
+      }
+    ]
+  },
+
+  "exports": {
+    "ChatRoom": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
