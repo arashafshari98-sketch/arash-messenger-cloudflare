@@ -4,98 +4,52 @@ export class ChatRoom {
     this.env = env;
   }
 
-  // ==========================================================
-  // HTTP / WEBSOCKET
-  // ==========================================================
-
   async fetch(request) {
     const url = new URL(request.url);
 
-    // --------------------------------------------------------
-    // WEBSOCKET
-    // --------------------------------------------------------
-
     if (url.pathname === "/ws") {
-
-      if (
-        request.headers.get("Upgrade") !== "websocket"
-      ) {
-        return new Response(
-          "WebSocket required",
-          {
-            status: 426
-          }
-        );
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("WebSocket required", { status: 426 });
       }
 
       const pair = new WebSocketPair();
-
       const client = pair[0];
       const server = pair[1];
 
-      // Accept WebSocket using Durable Object Hibernation API.
       this.ctx.acceptWebSocket(server);
 
-      // ------------------------------------------------------
-      // Send connection confirmation
-      // ------------------------------------------------------
-
-      server.send(
-        JSON.stringify({
-          type: "connected"
-        })
-      );
-
-      // ------------------------------------------------------
-      // Send saved history
-      // ------------------------------------------------------
+      server.send(JSON.stringify({
+        type: "connected"
+      }));
 
       try {
-
         const messages =
           await this.ctx.storage.get("messages") || [];
 
         for (const message of messages) {
-
-          server.send(
-            JSON.stringify({
-              type: "history",
-              ...message
-            })
-          );
-
+          server.send(JSON.stringify({
+            type: "history",
+            ...message
+          }));
         }
 
-        // Tell client that history is finished.
-
-        server.send(
-          JSON.stringify({
-            type: "history_end"
-          })
-        );
+        server.send(JSON.stringify({
+          type: "history_end"
+        }));
 
       } catch (error) {
 
-        server.send(
-          JSON.stringify({
-            type: "error",
-            message: "Could not load chat history."
-          })
-        );
+        server.send(JSON.stringify({
+          type: "error",
+          message: "Could not load chat history."
+        }));
       }
 
-      return new Response(
-        null,
-        {
-          status: 101,
-          webSocket: client
-        }
-      );
+      return new Response(null, {
+        status: 101,
+        webSocket: client
+      });
     }
-
-    // --------------------------------------------------------
-    // HISTORY HTTP ENDPOINT
-    // --------------------------------------------------------
 
     if (url.pathname === "/history") {
 
@@ -119,10 +73,6 @@ export class ChatRoom {
       }
     }
 
-    // --------------------------------------------------------
-    // HEALTH
-    // --------------------------------------------------------
-
     if (url.pathname === "/health") {
 
       return Response.json({
@@ -137,141 +87,180 @@ export class ChatRoom {
     );
   }
 
-
-  // ==========================================================
-  // WEBSOCKET MESSAGE
-  // ==========================================================
-
   async webSocketMessage(ws, message) {
 
     try {
 
-      const data =
-        JSON.parse(message);
+      const data = JSON.parse(message);
 
-      // Only accept chat messages.
+      // ====================================================
+      // NEW MESSAGE
+      // ====================================================
 
-      if (
-        data.type !== "message"
-      ) {
-        return;
-      }
+      if (data.type === "message") {
 
-      const text =
-        String(
-          data.message || ""
-        ).trim();
+        const text =
+          String(data.message || "").trim();
 
-      if (!text) {
-        return;
-      }
+        if (!text) {
+          return;
+        }
 
-      // ------------------------------------------------------
-      // Load history
-      // ------------------------------------------------------
+        const messages =
+          await this.ctx.storage.get("messages") || [];
 
-      const messages =
-        await this.ctx.storage.get("messages") || [];
+        const newMessage = {
 
-      // ------------------------------------------------------
-      // Create message
-      // ------------------------------------------------------
+          id:
+            String(
+              data.message_id ||
+              (
+                Date.now().toString() +
+                "-" +
+                Math.random()
+                  .toString(36)
+                  .substring(2, 8)
+              )
+            ),
 
-      const newMessage = {
+          client_id:
+            String(
+              data.client_id || ""
+            ),
 
-        // Internal unique message ID.
-        id:
-          Date.now().toString() +
-          "-" +
-          Math.random()
-            .toString(36)
-            .substring(2, 8),
+          sender:
+            "Someone",
 
-        // Internal client ID.
-        // NEVER shown in the UI.
-        client_id:
-          String(
-            data.client_id || ""
-          ),
+          message:
+            text,
 
-        sender:
-          "Someone",
+          time:
+            String(
+              data.time ||
+              new Date().toISOString()
+            )
+        };
 
-        message:
-          text,
+        messages.push(newMessage);
 
-        time:
-          String(
-            data.time ||
-            new Date().toISOString()
-          )
-      };
+        if (messages.length > 1000) {
 
-      // ------------------------------------------------------
-      // Save
-      // ------------------------------------------------------
+          messages.splice(
+            0,
+            messages.length - 1000
+          );
+        }
 
-      messages.push(
-        newMessage
-      );
-
-      // Keep only latest 1000 messages.
-
-      if (
-        messages.length > 1000
-      ) {
-
-        messages.splice(
-          0,
-          messages.length - 1000
+        await this.ctx.storage.put(
+          "messages",
+          messages
         );
+
+        const payload =
+          JSON.stringify({
+            type: "message",
+            ...newMessage
+          });
+
+        this.broadcast(payload);
+
+        return;
       }
 
-      await this.ctx.storage.put(
-        "messages",
-        messages
-      );
+      // ====================================================
+      // DELETE MESSAGE
+      // ====================================================
 
-      // ------------------------------------------------------
-      // Broadcast
-      // ------------------------------------------------------
+      if (data.type === "delete") {
 
-      const payload =
-        JSON.stringify({
-          type: "message",
-          ...newMessage
-        });
-
-      const sockets =
-        this.ctx.getWebSockets();
-
-      for (
-        const socket of sockets
-      ) {
-
-        try {
-
-          socket.send(
-            payload
+        const messageId =
+          String(
+            data.message_id || ""
           );
 
-        } catch (error) {
+        const clientId =
+          String(
+            data.client_id || ""
+          );
 
-          // Ignore dead connections.
+        const deleteMode =
+          String(
+            data.mode || "everyone"
+          );
 
+        if (!messageId) {
+          return;
         }
+
+        const messages =
+          await this.ctx.storage.get("messages") || [];
+
+        const index =
+          messages.findIndex(
+            item =>
+              String(item.id) === messageId
+          );
+
+        if (index === -1) {
+          return;
+        }
+
+        const target =
+          messages[index];
+
+        // Only the original sender can delete
+        // a message for everyone.
+
+        if (
+          deleteMode === "everyone" &&
+          String(target.client_id || "") !== clientId
+        ) {
+
+          ws.send(JSON.stringify({
+            type: "error",
+            message: "You cannot delete this message."
+          }));
+
+          return;
+        }
+
+        // For everyone, permanently remove it
+        // from Cloudflare history.
+
+        if (deleteMode === "everyone") {
+
+          messages.splice(
+            index,
+            1
+          );
+
+          await this.ctx.storage.put(
+            "messages",
+            messages
+          );
+
+          this.broadcast(
+            JSON.stringify({
+              type: "deleted",
+              message_id: messageId,
+              mode: "everyone"
+            })
+          );
+
+          return;
+        }
+
+        return;
       }
 
     } catch (error) {
 
       try {
 
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "Invalid message."
-          })
-        );
+        ws.send(JSON.stringify({
+          type: "error",
+          message: "Invalid message."
+        }));
 
       } catch (e) {
         // Ignore.
@@ -279,57 +268,58 @@ export class ChatRoom {
     }
   }
 
+  // ========================================================
+  // BROADCAST
+  // ========================================================
 
-  // ==========================================================
-  // WEBSOCKET CLOSE
-  // ==========================================================
+  broadcast(payload) {
+
+    const sockets =
+      this.ctx.getWebSockets();
+
+    for (const socket of sockets) {
+
+      try {
+
+        socket.send(payload);
+
+      } catch (error) {
+
+        // Ignore dead connections.
+      }
+    }
+  }
+
+  // ========================================================
+  // CLOSE
+  // ========================================================
 
   async webSocketClose(
     ws,
     code,
     reason,
     wasClean
-  ) {
-
-    // Nothing required here.
-  }
-
-
-  // ==========================================================
-  // WEBSOCKET ERROR
-  // ==========================================================
+  ) {}
 
   async webSocketError(
     ws,
     error
-  ) {
-
-    // Nothing required here.
-  }
+  ) {}
 }
 
 
-// ============================================================
+// ==========================================================
 // WORKER
-// ============================================================
+// ==========================================================
 
 export default {
 
-  async fetch(
-    request,
-    env
-  ) {
+  async fetch(request, env) {
 
     const url =
       new URL(request.url);
 
-    // --------------------------------------------------------
-    // PUBLIC CHAT WEBSOCKET
-    // --------------------------------------------------------
-
-    if (
-      url.pathname === "/ws"
-    ) {
+    if (url.pathname === "/ws") {
 
       const id =
         env.CHAT.idFromName(
@@ -339,18 +329,10 @@ export default {
       const room =
         env.CHAT.get(id);
 
-      return room.fetch(
-        request
-      );
+      return room.fetch(request);
     }
 
-    // --------------------------------------------------------
-    // PUBLIC CHAT HISTORY
-    // --------------------------------------------------------
-
-    if (
-      url.pathname === "/history"
-    ) {
+    if (url.pathname === "/history") {
 
       const id =
         env.CHAT.idFromName(
@@ -360,28 +342,16 @@ export default {
       const room =
         env.CHAT.get(id);
 
-      return room.fetch(
-        request
-      );
+      return room.fetch(request);
     }
 
-    // --------------------------------------------------------
-    // HEALTH
-    // --------------------------------------------------------
-
-    if (
-      url.pathname === "/health"
-    ) {
+    if (url.pathname === "/health") {
 
       return Response.json({
         status: "ok",
         service: "ARASH MESSENGER"
       });
     }
-
-    // --------------------------------------------------------
-    // HOME
-    // --------------------------------------------------------
 
     return new Response(
       "ARASH MESSENGER SERVER ONLINE",
