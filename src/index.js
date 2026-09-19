@@ -4,118 +4,392 @@ export class ChatRoom {
     this.env = env;
   }
 
+  // ==========================================================
+  // HTTP / WEBSOCKET
+  // ==========================================================
+
   async fetch(request) {
     const url = new URL(request.url);
 
+    // --------------------------------------------------------
+    // WEBSOCKET
+    // --------------------------------------------------------
+
     if (url.pathname === "/ws") {
-      if (request.headers.get("Upgrade") !== "websocket") {
-        return new Response("WebSocket required", { status: 426 });
+
+      if (
+        request.headers.get("Upgrade") !== "websocket"
+      ) {
+        return new Response(
+          "WebSocket required",
+          {
+            status: 426
+          }
+        );
       }
 
       const pair = new WebSocketPair();
+
       const client = pair[0];
       const server = pair[1];
 
+      // Accept WebSocket using Durable Object Hibernation API.
       this.ctx.acceptWebSocket(server);
 
-      server.send(JSON.stringify({
-        type: "connected"
-      }));
+      // ------------------------------------------------------
+      // Send connection confirmation
+      // ------------------------------------------------------
 
-      return new Response(null, {
-        status: 101,
-        webSocket: client
+      server.send(
+        JSON.stringify({
+          type: "connected"
+        })
+      );
+
+      // ------------------------------------------------------
+      // Send saved history
+      // ------------------------------------------------------
+
+      try {
+
+        const messages =
+          await this.ctx.storage.get("messages") || [];
+
+        for (const message of messages) {
+
+          server.send(
+            JSON.stringify({
+              type: "history",
+              ...message
+            })
+          );
+
+        }
+
+        // Tell client that history is finished.
+
+        server.send(
+          JSON.stringify({
+            type: "history_end"
+          })
+        );
+
+      } catch (error) {
+
+        server.send(
+          JSON.stringify({
+            type: "error",
+            message: "Could not load chat history."
+          })
+        );
+      }
+
+      return new Response(
+        null,
+        {
+          status: 101,
+          webSocket: client
+        }
+      );
+    }
+
+    // --------------------------------------------------------
+    // HISTORY HTTP ENDPOINT
+    // --------------------------------------------------------
+
+    if (url.pathname === "/history") {
+
+      try {
+
+        const messages =
+          await this.ctx.storage.get("messages") || [];
+
+        return Response.json(messages);
+
+      } catch (error) {
+
+        return Response.json(
+          {
+            error: "Could not load history."
+          },
+          {
+            status: 500
+          }
+        );
+      }
+    }
+
+    // --------------------------------------------------------
+    // HEALTH
+    // --------------------------------------------------------
+
+    if (url.pathname === "/health") {
+
+      return Response.json({
+        status: "ok",
+        service: "ARASH MESSENGER",
+        chat: "online"
       });
     }
 
-    if (url.pathname === "/history") {
-      const messages = await this.ctx.storage.get("messages") || [];
-
-      return Response.json(messages);
-    }
-
-    return new Response("ARASH MESSENGER CHAT ROOM ONLINE");
+    return new Response(
+      "ARASH MESSENGER CHAT ROOM ONLINE"
+    );
   }
 
-  async webSocketMessage(ws, message) {
-    try {
-      const data = JSON.parse(message);
 
-      if (data.type !== "message") {
+  // ==========================================================
+  // WEBSOCKET MESSAGE
+  // ==========================================================
+
+  async webSocketMessage(ws, message) {
+
+    try {
+
+      const data =
+        JSON.parse(message);
+
+      // Only accept chat messages.
+
+      if (
+        data.type !== "message"
+      ) {
         return;
       }
+
+      const text =
+        String(
+          data.message || ""
+        ).trim();
+
+      if (!text) {
+        return;
+      }
+
+      // ------------------------------------------------------
+      // Load history
+      // ------------------------------------------------------
 
       const messages =
         await this.ctx.storage.get("messages") || [];
 
+      // ------------------------------------------------------
+      // Create message
+      // ------------------------------------------------------
+
       const newMessage = {
-        id: Date.now(),
-        sender: data.sender || "Someone",
-        message: String(data.message || ""),
-        time: data.time || new Date().toISOString()
+
+        // Internal unique message ID.
+        id:
+          Date.now().toString() +
+          "-" +
+          Math.random()
+            .toString(36)
+            .substring(2, 8),
+
+        // Internal client ID.
+        // NEVER shown in the UI.
+        client_id:
+          String(
+            data.client_id || ""
+          ),
+
+        sender:
+          "Someone",
+
+        message:
+          text,
+
+        time:
+          String(
+            data.time ||
+            new Date().toISOString()
+          )
       };
 
-      messages.push(newMessage);
+      // ------------------------------------------------------
+      // Save
+      // ------------------------------------------------------
 
-      // فقط آخرین 1000 پیام را نگه می‌داریم
-      if (messages.length > 1000) {
-        messages.splice(0, messages.length - 1000);
+      messages.push(
+        newMessage
+      );
+
+      // Keep only latest 1000 messages.
+
+      if (
+        messages.length > 1000
+      ) {
+
+        messages.splice(
+          0,
+          messages.length - 1000
+        );
       }
 
-      await this.ctx.storage.put("messages", messages);
+      await this.ctx.storage.put(
+        "messages",
+        messages
+      );
 
-      const payload = JSON.stringify({
-        type: "message",
-        ...newMessage
-      });
+      // ------------------------------------------------------
+      // Broadcast
+      // ------------------------------------------------------
 
-      for (const socket of this.ctx.getWebSockets()) {
+      const payload =
+        JSON.stringify({
+          type: "message",
+          ...newMessage
+        });
+
+      const sockets =
+        this.ctx.getWebSockets();
+
+      for (
+        const socket of sockets
+      ) {
+
         try {
-          socket.send(payload);
-        } catch (e) {
-          // اتصال خراب است؛ نادیده می‌گیریم
+
+          socket.send(
+            payload
+          );
+
+        } catch (error) {
+
+          // Ignore dead connections.
+
         }
       }
 
-    } catch (e) {
-      // پیام نامعتبر
+    } catch (error) {
+
+      try {
+
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Invalid message."
+          })
+        );
+
+      } catch (e) {
+        // Ignore.
+      }
     }
   }
 
-  async webSocketClose(ws) {
-    // اتصال بسته شد
+
+  // ==========================================================
+  // WEBSOCKET CLOSE
+  // ==========================================================
+
+  async webSocketClose(
+    ws,
+    code,
+    reason,
+    wasClean
+  ) {
+
+    // Nothing required here.
   }
 
-  async webSocketError(ws) {
-    // خطای اتصال
+
+  // ==========================================================
+  // WEBSOCKET ERROR
+  // ==========================================================
+
+  async webSocketError(
+    ws,
+    error
+  ) {
+
+    // Nothing required here.
   }
 }
 
 
+// ============================================================
+// WORKER
+// ============================================================
+
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
 
-    if (url.pathname === "/ws") {
-      const id = env.CHAT.idFromName("public-chat");
-      const room = env.CHAT.get(id);
+  async fetch(
+    request,
+    env
+  ) {
 
-      return room.fetch(request);
+    const url =
+      new URL(request.url);
+
+    // --------------------------------------------------------
+    // PUBLIC CHAT WEBSOCKET
+    // --------------------------------------------------------
+
+    if (
+      url.pathname === "/ws"
+    ) {
+
+      const id =
+        env.CHAT.idFromName(
+          "public-chat"
+        );
+
+      const room =
+        env.CHAT.get(id);
+
+      return room.fetch(
+        request
+      );
     }
 
-    if (url.pathname === "/history") {
-      const id = env.CHAT.idFromName("public-chat");
-      const room = env.CHAT.get(id);
+    // --------------------------------------------------------
+    // PUBLIC CHAT HISTORY
+    // --------------------------------------------------------
 
-      return room.fetch(request);
+    if (
+      url.pathname === "/history"
+    ) {
+
+      const id =
+        env.CHAT.idFromName(
+          "public-chat"
+        );
+
+      const room =
+        env.CHAT.get(id);
+
+      return room.fetch(
+        request
+      );
     }
+
+    // --------------------------------------------------------
+    // HEALTH
+    // --------------------------------------------------------
+
+    if (
+      url.pathname === "/health"
+    ) {
+
+      return Response.json({
+        status: "ok",
+        service: "ARASH MESSENGER"
+      });
+    }
+
+    // --------------------------------------------------------
+    // HOME
+    // --------------------------------------------------------
 
     return new Response(
       "ARASH MESSENGER SERVER ONLINE",
       {
         status: 200,
         headers: {
-          "Content-Type": "text/plain; charset=utf-8"
+          "Content-Type":
+            "text/plain; charset=utf-8"
         }
       }
     );
